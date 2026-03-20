@@ -2,12 +2,14 @@ import itertools
 import mmap
 import struct
 import sys
-from typing import Any, Sequence
 import weakref
-from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from enum import StrEnum
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Sequence
 
 
 class DType(StrEnum):
@@ -16,7 +18,7 @@ class DType(StrEnum):
 
 
 @dataclass(slots=True, weakref_slot=True, frozen=True)
-class MemorySpan:
+class Span:
     offset: int
     size: int
 
@@ -37,19 +39,20 @@ class MemoryFrame:
     def __init__(
         self,
         mm: mmap.mmap,
-        span: MemorySpan,
+        span: Span,
         dtype: DType,
-        on_dealloc: Callable[[MemorySpan], None],
-        subspan: MemorySpan | None = None,
+        on_dealloc: Callable[[Span], None],
+        subspan: Span | None = None,
+        contiguous: bool = True,
     ) -> None:
         self.contiguous = True
 
         self.__mm = mm
         self.__span = span
-        self.__subspan = subspan or MemorySpan(span.offset, span.size)
+        self.__subspan = subspan or Span(span.offset, span.size)
         self.__dtype = dtype
         self.__unitsize = struct.calcsize(dtype)
-
+        self.__contiguous = contiguous
         self.__on_dealloc = on_dealloc
 
         if subspan is None:
@@ -64,11 +67,11 @@ class MemoryFrame:
         mm: mmap.mmap,
         offset: int,
         size: int,
-        on_dealloc: Callable[[MemorySpan], None],
+        on_dealloc: Callable[[Span], None],
     ) -> None:
         with suppress(Exception):
             mm.madvise(mmap.MADV_FREE, offset, size)
-        on_dealloc(MemorySpan(offset, size))
+        on_dealloc(Span(offset, size))
 
     def ptr(self, idx: int, count: int, contiguous: bool) -> MemoryFrame:
         if not idx and count == len(self):
@@ -77,23 +80,22 @@ class MemoryFrame:
         offset = self.__subspan.offset + idx * self.__unitsize
         size = count * self.__unitsize
 
-        subspan = MemorySpan(offset=offset, size=size)
+        subspan = Span(offset=offset, size=size)
         if self.offset > subspan.offset or self.__span.end < subspan.end:
             msg = "Pointer exceeds frame's allocated space"
             raise MemoryError(msg)
 
         return self._new_ptr(subspan, contiguous)
 
-    def _new_ptr(self, subspan: MemorySpan | None, contiguous: bool) -> MemoryFrame:
-        frame = MemoryFrame(
+    def _new_ptr(self, subspan: Span, contiguous: bool) -> MemoryFrame:
+        return MemoryFrame(
             mm=self.__mm,
             span=self.__span,
             subspan=subspan,
             on_dealloc=self.__on_dealloc,
             dtype=self.__dtype,
+            contiguous=contiguous,
         )
-        frame.contiguous = contiguous
-        return frame
 
     def write(self, data: Sequence) -> None:
         if self.shares_ownership():
