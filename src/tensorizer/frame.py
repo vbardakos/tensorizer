@@ -1,5 +1,8 @@
+import itertools
 import mmap
 import struct
+import sys
+from typing import Any, Sequence
 import weakref
 from collections.abc import Callable
 from contextlib import suppress
@@ -12,122 +15,131 @@ class DType(StrEnum):
     F32 = "f"
 
 
-@dataclass(slots=True, frozen=True)
-class MemLoc:
-    start: int
-    allocsize: int
+@dataclass(slots=True, weakref_slot=True, frozen=True)
+class MemorySpan:
+    offset: int
+    size: int
 
     @property
     def slice(self) -> slice:
-        return slice(self.start, self.stop)
+        return slice(self.offset, self.end)
 
     @property
-    def stop(self) -> int:
-        return self.start + self.allocsize
+    def end(self) -> int:
+        return self.offset + self.size
+
+    def refcount(self) -> int:
+        """Counter of strong references."""
+        return sys.getrefcount(self) - 1
 
 
-class MemFrame:
+class MemoryFrame:
     def __init__(
         self,
         mm: mmap.mmap,
-        memloc: MemLoc,
-        tt: DType,
-        notify_release: Callable[[MemLoc], None],
-        relloc: MemLoc | None = None,
-        refs: weakref.WeakSet | None = None,
+        span: MemorySpan,
+        dtype: DType,
+        on_dealloc: Callable[[MemorySpan], None],
+        subspan: MemorySpan | None = None,
     ) -> None:
-        if not refs:
-            self.__mm.madvise(mmap.MADV_WILLNEED, memloc.start, memloc.allocsize)
+        self.contiguous = True
 
         self.__mm = mm
-        self.__memloc = memloc
-        self.__relloc = relloc or memloc
+        self.__span = span
+        self.__subspan = subspan or MemorySpan(span.offset, span.size)
+        self.__dtype = dtype
+        self.__unitsize = struct.calcsize(dtype)
 
-        self.__dtype = tt
-        self.__unitsize = struct.calcsize(tt)
+        self.__on_dealloc = on_dealloc
 
-        self.__on_release = notify_release
+        if subspan is None:
+            self.__mm.madvise(mmap.MADV_WILLNEED, span.offset, span.size)
 
-        refs = refs or weakref.WeakSet()
-        refs.add(self)
-        self.__refs = refs
-
-        weakref.finalize(self, MemFrame._release, mm, memloc, refs, notify_release)
+            weakref.finalize(
+                span, MemoryFrame._dealloc, mm, span.offset, span.size, on_dealloc
+            )
 
     @staticmethod
-    def _release(
+    def _dealloc(
         mm: mmap.mmap,
-        memloc: MemLoc,
-        refs: weakref.WeakSet,
-        on_release: Callable[[MemLoc], None],
+        offset: int,
+        size: int,
+        on_dealloc: Callable[[MemorySpan], None],
     ) -> None:
-        if any(ref for ref in refs):
-            return
-
         with suppress(Exception):
-            mm.madvise(mmap.MADV_FREE, memloc.start, memloc.allocsize)
-        on_release(memloc)
+            mm.madvise(mmap.MADV_FREE, offset, size)
+        on_dealloc(MemorySpan(offset, size))
 
-    def raw_ptr(self, reloffset: int, allocsize: int) -> MemFrame:
-        if not (reloffset or allocsize):
-            return self._new_ptr(None)
+    def ptr(self, idx: int, count: int, contiguous: bool) -> MemoryFrame:
+        if not idx and count == len(self):
+            return self._new_ptr(self.__subspan, contiguous)
 
-        relloc = MemLoc(self.__relloc.start + reloffset, allocsize)
-        if self.memoffset > relloc.start or self.__memloc.stop < relloc.stop:
-            msg = "Pointer exceeds frame's allocated space"
-            raise MemoryError(msg)
-        return self._new_ptr(relloc)
+        offset = self.__subspan.offset + idx * self.__unitsize
+        size = count * self.__unitsize
 
-    def ptr(self, from_idx: int, size: int) -> MemFrame:
-        if not (from_idx or size):
-            return self._new_ptr(None)
-
-        reloffset = from_idx * self.__unitsize
-        allocsize = size * self.__unitsize
-
-        relloc = MemLoc(start=self.__relloc.start + reloffset, allocsize=allocsize)
-        if self.memoffset > relloc.start or self.__memloc.stop < relloc.stop:
+        subspan = MemorySpan(offset=offset, size=size)
+        if self.offset > subspan.offset or self.__span.end < subspan.end:
             msg = "Pointer exceeds frame's allocated space"
             raise MemoryError(msg)
 
-        return self._new_ptr(relloc)
+        return self._new_ptr(subspan, contiguous)
 
-    def _new_ptr(self, relloc: MemLoc | None) -> MemFrame:
-        return MemFrame(
+    def _new_ptr(self, subspan: MemorySpan | None, contiguous: bool) -> MemoryFrame:
+        frame = MemoryFrame(
             mm=self.__mm,
-            memloc=self.__memloc,
-            relloc=relloc,
-            notify_release=self.__on_release,
-            tt=self.__dtype,
-            refs=self.__refs,
+            span=self.__span,
+            subspan=subspan,
+            on_dealloc=self.__on_dealloc,
+            dtype=self.__dtype,
         )
+        frame.contiguous = contiguous
+        return frame
 
-    def write(self, data: bytes) -> None:
-        self.__mm[self.__relloc.slice] = data
+    def write(self, data: Sequence) -> None:
+        if self.shares_ownership():
+            msg = "Cannot write on shared Memory space"
+            raise BufferError(msg)
+        fmt = f"{len(data)}{self.__dtype}"
+        self.__mm[self.__subspan.slice] = struct.pack(fmt, *data)
 
-    def fill(self, value) -> None:
-        packed = struct.pack(self.__dtype, value)
-        self.__mm[self.__relloc.slice] = packed * len(self)
+    def write_bytes(self, data: bytes) -> None:
+        if self.shares_ownership():
+            msg = "Cannot write on shared Memory space"
+            raise BufferError(msg)
+        self.__mm[self.__subspan.slice] = data
+
+    def fill(self, value: Any) -> None:
+        if self.shares_ownership():
+            msg = "Cannot write on shared Memory space"
+            raise BufferError(msg)
+
+        fmt = f"{len(self)}{self.__dtype}"
+        values = itertools.repeat(value, len(self))
+        struct.pack_into(fmt, self.__mm, self.__subspan.offset, *values)
 
     def raw_buf(self) -> memoryview:
-        return memoryview(self.__mm)[self.__relloc.slice]
+        return memoryview(self.__mm)[self.__subspan.slice]
 
     def buf(self) -> memoryview:
         return self.raw_buf().cast(self.__dtype)
 
-    def is_referenced(self) -> bool:
-        return len(self.__refs) > 1
+    def shares_ownership(self) -> bool:
+        return self.__span.refcount() > 1
 
     @property
-    def memoffset(self) -> int:
-        return self.__memloc.start
+    def offset(self) -> int:
+        return self.__span.offset
 
     @property
-    def allocsize(self) -> int:
-        return self.__memloc.allocsize
+    def size(self) -> int:
+        return self.__span.size
+
+    @property
+    def dtype(self) -> DType:
+        return self.__dtype
 
     def __len__(self) -> int:
-        return self.__relloc.allocsize // self.__unitsize
+        return self.__subspan.size // self.__unitsize
 
     def __repr__(self) -> str:
-        return f"MemoryFrame(memoffset={self.memoffset}, allocsize={self.allocsize}, size={len(self)})"  # noqa: E501
+        return f"MemoryFrame(offset={self.offset}, size={self.size}, shared={self.shares_ownership()})"  # noqa: E501
