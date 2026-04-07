@@ -3,14 +3,17 @@ import mmap
 import os
 import struct
 import weakref
-from typing import Final
+from typing import TYPE_CHECKING, Final
 
-from tensorizer.frame import DType, MemFrame, MemLoc
+from tensorizer.frame import DType, MemoryFrame, Span
 
-ALLOC_CAPACITY: Final[int] = int(os.environ.get("ALLOC_CAPACITY", str(10 << 10)))
+if TYPE_CHECKING:
+    from tensorizer.tensor import Tensor
+
+ARENA_CAPACITY: Final[int] = int(os.environ.get("ALLOC_CAPACITY", str(10 << 10)))
 
 
-class _WeakSingleton(type):
+class _EphemeralSingleton(type):
     __instance: weakref.ReferenceType[Allocator] | None = None
 
     def __call__(cls, *args, **kwargs):
@@ -19,13 +22,13 @@ class _WeakSingleton(type):
             if instance is not None:
                 return instance
 
-        instance = super().__call__(*args, **kwargs)
-        instance._open(ALLOC_CAPACITY)
+        instance: Allocator = super().__call__(*args, **kwargs)
+        instance._setup(ARENA_CAPACITY)
         cls.__instance = weakref.ref(instance)
         return instance
 
 
-class Allocator(metaclass=_WeakSingleton):
+class Allocator(metaclass=_EphemeralSingleton):
     def __init__(self) -> None:
         self.__mm = None
         self.__capacity = None
@@ -33,48 +36,74 @@ class Allocator(metaclass=_WeakSingleton):
         self.__offset = 0
         self.__freelocs = []
 
-    def _open(self, capacity: int) -> None:
+    def _setup(self, capacity: int) -> None:
         if self.__mm is not None:
             raise TypeError
 
         self.__mm = mmap.mmap(-1, capacity)
         self.__capacity = capacity
 
+        # unsafe: all mmap ptrs need cleanup first
         weakref.finalize(self, mmap.mmap.close, self.__mm)
 
-    def alloc(self, tensor: "Tensor", count: int, dtype: DType) -> MemFrame:
-        allocsize = count * struct.calcsize(dtype)
-        memloc = self.__retrieve_memloc(allocsize)
-        memframe = MemFrame(
-            self.__mm, memloc, tt=dtype, notify_release=self._on_release
+    def alloc(self, tensor: Tensor, count: int, dtype: DType) -> MemoryFrame:
+        """
+        indices
+        ---
+        span:       offset :: aligned(offset + size)
+        subspan:    offset :: offset + size
+        remainder:  offset + size :: aligned(offset + size)
+
+        check freelocs -> assign to freelocs
+        create new -> ...
+        """
+        size = count * struct.calcsize(dtype)
+        span = self.__create_span(size)
+        subspan = Span(span.offset, size) if span.size != size else None
+        memframe = MemoryFrame(
+            self.__mm,
+            span,
+            dtype=dtype,
+            on_dealloc=self._on_dealloc,
+            subspan=subspan,
         )
+        self.__stash_remainder(span, dtype)
         self.__allocs[tensor] = memframe
         return memframe
 
     def collect(self) -> None:
         """
-        Check median & total __freelocs
-        Use dontneed
+        use freeloc stats (eg Check median & total freelocs)
+        use madv dontneed (frame uses lazy free)
         """
 
-    def _on_release(self, memloc: MemLoc) -> None:
-        bisect.insort_right(self.__freelocs, memloc, key=lambda loc: loc.allocsize)
+    def _on_dealloc(self, span: Span) -> None:
+        """Retrieves free frame for reallocation"""
+        bisect.insort_right(self.__freelocs, span, key=lambda span: span.size)
 
-    def __retrieve_memloc(self, allocsize: int) -> MemLoc:
-        pos = bisect.bisect_left(
-            self.__freelocs, allocsize, key=lambda loc: loc.allocsize
-        )
-        if pos < len(self.__freelocs):
-            return self.__freelocs.pop(pos)
+    def __create_span(self, size: int) -> Span:
+        # Check if there's a existing free span which fits the new alloc
+        idx = bisect.bisect_left(self.__freelocs, size, key=lambda span: span.size)
+        if idx < len(self.__freelocs):
+            return self.__freelocs.pop(idx)
 
-        aligned = self.__paginate(self.__offset)
-        if aligned + allocsize > self.__capacity:
+        aligned = self.__align(self.__offset)
+        if aligned + size > self.__capacity:
             raise MemoryError
 
-        memloc = MemLoc(start=aligned, allocsize=allocsize)
-        self.__offset = memloc.stop
-        return memloc
+        span = Span(offset=aligned, size=size)
+        self.__offset = span.end
+        return span
+
+    def __stash_remainder(self, span: Span, dtype: DType) -> None:
+        remainder_size = self.__align(span.end) - span.end
+
+        if remainder_size < struct.calcsize(dtype) * 4:
+            return
+
+        remainder = Span(span.end, remainder_size)
+        self._on_dealloc(remainder)
 
     @staticmethod
-    def __paginate(loc: int) -> int:
-        return (loc + mmap.PAGESIZE - 1) & ~(mmap.PAGESIZE - 1)
+    def __align(offset: int) -> int:
+        return (offset + mmap.PAGESIZE - 1) & ~(mmap.PAGESIZE - 1)
