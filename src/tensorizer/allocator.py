@@ -10,7 +10,7 @@ from tensorizer.frame import DType, MemoryFrame, Span
 if TYPE_CHECKING:
     from tensorizer.tensor import Tensor
 
-ARENA_CAPACITY: Final[int] = int(os.environ.get("ALLOC_CAPACITY", str(10 << 10)))
+ARENA_CAPACITY: Final[int] = int(os.environ.get("ARENA_CAPACITY", str(10 << 10)))
 
 
 class _EphemeralSingleton(type):
@@ -57,6 +57,11 @@ class Allocator(metaclass=_EphemeralSingleton):
         check freelocs -> assign to freelocs
         create new -> ...
         """
+        frame = self.alloc_raw(count, dtype)
+        self.__allocs[tensor] = frame
+        return frame
+
+    def alloc_raw(self, count: int, dtype: DType) -> MemoryFrame:
         size = count * struct.calcsize(dtype)
         span = self.__create_span(size)
         subspan = Span(span.offset, size) if span.size != size else None
@@ -68,7 +73,6 @@ class Allocator(metaclass=_EphemeralSingleton):
             subspan=subspan,
         )
         self.__stash_remainder(span, dtype)
-        self.__allocs[tensor] = memframe
         return memframe
 
     def collect(self) -> None:
