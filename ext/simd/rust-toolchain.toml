@@ -1,0 +1,4 @@
+# note :: we need this to use unstable std::simd
+# Alternatively, we must use NEON & AVX primitives under different architecture configs
+[toolchain]
+channel = "nightly"
