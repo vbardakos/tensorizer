@@ -1,4 +1,3 @@
-import itertools
 import mmap
 import struct
 import sys
@@ -45,8 +44,6 @@ class MemoryFrame:
         subspan: Span | None = None,
         contiguous: bool = True,
     ) -> None:
-        self.contiguous = True
-
         self.__mm = mm
         self.__span = span
         self.__subspan = subspan or Span(span.offset, span.size)
@@ -102,7 +99,7 @@ class MemoryFrame:
             msg = "Cannot write on shared Memory space"
             raise BufferError(msg)
         fmt = f"{len(data)}{self.__dtype}"
-        self.__mm[self.__subspan.slice] = struct.pack(fmt, *data)
+        struct.pack_into(fmt, self.__mm, self.__subspan.offset, *data)
 
     def write_bytes(self, data: bytes) -> None:
         if self.shares_ownership():
@@ -115,15 +112,14 @@ class MemoryFrame:
             msg = "Cannot write on shared Memory space"
             raise BufferError(msg)
 
-        fmt = f"{len(self)}{self.__dtype}"
-        values = itertools.repeat(value, len(self))
-        struct.pack_into(fmt, self.__mm, self.__subspan.offset, *values)
+        single = struct.pack(self.__dtype, value)
+        self.__mm[self.__subspan.slice] = single * len(self)
 
-    def raw_buf(self) -> memoryview:
+    def raw_buffer(self) -> memoryview:
         return memoryview(self.__mm)[self.__subspan.slice]
 
-    def buf(self) -> memoryview:
-        return self.raw_buf().cast(self.__dtype)
+    def buffer[T](self) -> memoryview[T]:
+        return self.raw_buffer().cast(self.__dtype)
 
     def shares_ownership(self) -> bool:
         return self.__span.refcount() > 1
