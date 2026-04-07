@@ -2,7 +2,7 @@
 // Uses std::simd (portable SIMD) — compiles to NEON on ARM, AVX on x86.
 // Requires nightly: rustup run nightly cargo build
 //
-// The commented alternatives auto-vectorize to identical assembly under -O.
+// The commented alternatives MOST PROBABLY auto-vectorize to identical assembly under -O.
 // Verify with: rustc -O --crate-type lib --emit asm -C target-cpu=native
 
 use std::simd::prelude::*;
@@ -73,14 +73,14 @@ pub(crate) fn neg_f32(a: &[f32]) -> Vec<f32> {
     out
 }
 
-// auto-vectorizes: a.iter().sum()
-pub(crate) fn sum_f32(a: &[f32]) -> f32 {
+// auto-vectorizes: a.iter().map(|&x| x as f64).sum()
+pub(crate) fn sum_f32(a: &[f32]) -> f64 {
     let a = pad_slice(a, 0.0);
     let (chunks, _) = a.as_chunks::<LANES>();
 
-    let mut acc = f32x4::splat(0.0);
+    let mut acc = f64x4::splat(0.0);
     for chunk in chunks {
-        acc += f32x4::from_array(*chunk);
+        acc += f32x4::from_array(*chunk).cast::<f64>();
     }
     acc.reduce_sum()
 }

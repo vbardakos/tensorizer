@@ -48,7 +48,7 @@ mod _core {
     }
 
     #[pyfunction]
-    fn sum_f32(py: Python<'_>, a: PyBuffer<f32>) -> f32 {
+    fn sum_f32(py: Python<'_>, a: PyBuffer<f32>) -> f64 {
         ops::sum_f32(a.into_slice(py))
     }
 }
